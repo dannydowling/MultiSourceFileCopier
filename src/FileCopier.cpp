@@ -1,10 +1,20 @@
 #include "../include/FileCopier.h"
+#include <C:/temp/boost_1_88_0/boost/thread.hpp>
+#include <C:/temp/boost_1_88_0/boost/thread/mutex.hpp>
+#include <C:/temp/boost_1_88_0/boost/thread/condition_variable.hpp>
+#include <C:/temp/boost_1_88_0/boost/chrono.hpp>
 #include <shlwapi.h>
 #include <algorithm>
 #include <strsafe.h>
+#include <queue>
+#include <vector>
+#include <memory>
+
 #pragma comment(lib, "shlwapi.lib")
 
-// Thread procedure
+
+
+// Thread procedure implementation
 DWORD WINAPI CopyThreadProc(LPVOID lpParameter)
 {
     CopyThreadParam* pParam = static_cast<CopyThreadParam*>(lpParameter);
@@ -15,12 +25,15 @@ DWORD WINAPI CopyThreadProc(LPVOID lpParameter)
     return 0;
 }
 
+// Constructor
 FileCopier::FileCopier()
     : m_packetSize(65536),
     m_thread(NULL),
     m_operationInProgress(false),
     m_totalPackets(0),
-    m_completedPackets(0)
+    m_completedPackets(0),
+    m_progressCallback(nullptr),
+    m_userData(nullptr)
 {
     // Create cancel event (manual reset)
     m_cancelEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -32,6 +45,7 @@ FileCopier::FileCopier()
     m_buffer = std::make_unique<BYTE[]>(BUFFER_SIZE);
 }
 
+// Destructor
 FileCopier::~FileCopier()
 {
     // Cancel any ongoing operation
@@ -56,6 +70,7 @@ FileCopier::~FileCopier()
     DeleteCriticalSection(&m_cs);
 }
 
+// Add a source file
 void FileCopier::AddSource(const std::wstring& path)
 {
     // Don't modify sources during an operation
@@ -78,6 +93,7 @@ void FileCopier::AddSource(const std::wstring& path)
     m_sources.push_back(info);
 }
 
+// Remove a source file
 void FileCopier::RemoveSource(size_t index)
 {
     // Don't modify sources during an operation
@@ -90,6 +106,7 @@ void FileCopier::RemoveSource(size_t index)
     }
 }
 
+// Clear all sources
 void FileCopier::ClearSources()
 {
     // Don't modify sources during an operation
@@ -99,11 +116,13 @@ void FileCopier::ClearSources()
     m_sources.clear();
 }
 
+// Get list of sources
 const std::vector<SourceInfo>& FileCopier::GetSources() const
 {
     return m_sources;
 }
 
+// Start copying files
 bool FileCopier::StartCopy(
     const std::wstring& destinationPath,
     ProgressCallbackFunc progressCallback,
@@ -118,38 +137,17 @@ bool FileCopier::StartCopy(
     if (m_sources.empty())
         return false;
 
-    // Get the first source file information to determine size
-    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
-    if (!GetFileAttributesEx(m_sources[0].path.c_str(), GetFileExInfoStandard, &fileInfo))
-        return false;
-
-    // Extract filename from the first source
-    const wchar_t* fileName = PathFindFileName(m_sources[0].path.c_str());
-    if (!fileName || !*fileName)
-        return false;
-
-    // Set destination file path
+    // Set destination path
     m_destinationPath = destinationPath;
 
     // Ensure the destination path ends with a backslash
     if (!m_destinationPath.empty() && m_destinationPath.back() != L'\\')
         m_destinationPath += L'\\';
 
-    // Append the filename to get the full destination path
-    m_destinationFilename = m_destinationPath + fileName;
-
     // Store parameters
     m_packetSize = packetSize;
     m_progressCallback = progressCallback;
     m_userData = userData;
-
-    // Calculate total number of packets
-    LARGE_INTEGER fileSize;
-    fileSize.HighPart = fileInfo.nFileSizeHigh;
-    fileSize.LowPart = fileInfo.nFileSizeLow;
-
-    m_totalPackets = static_cast<int>((fileSize.QuadPart + m_packetSize - 1) / m_packetSize);
-    m_completedPackets = 0;
 
     // Reset cancel event
     ResetEvent(m_cancelEvent);
@@ -176,6 +174,8 @@ bool FileCopier::StartCopy(
     return true;
 }
 
+
+// Cancel the copy operation
 void FileCopier::Cancel()
 {
     if (m_operationInProgress && m_thread && m_cancelEvent)
@@ -187,6 +187,7 @@ void FileCopier::Cancel()
         if (WaitForSingleObject(m_thread, 5000) == WAIT_TIMEOUT)
         {
             // Force terminate the thread if it doesn't exit gracefully
+#pragma warning(suppress: 6258) // Intentional force termination after timeout
             TerminateThread(m_thread, 1);
         }
 
@@ -197,128 +198,13 @@ void FileCopier::Cancel()
     }
 }
 
+// Check if a copy is in progress
 bool FileCopier::IsOperationInProgress() const
 {
     return m_operationInProgress;
 }
 
-void FileCopier::DoCopyOperation()
-{
-    // Create the destination directory if it doesn't exist
-    if (!CreateDirectory(m_destinationPath.c_str(), NULL))
-    {
-        // Check if the error was because the directory already exists
-        if (GetLastError() != ERROR_ALREADY_EXISTS)
-        {
-            // Directory creation failed and it doesn't exist
-            EnterCriticalSection(&m_cs);
-            m_operationInProgress = false;
-            LeaveCriticalSection(&m_cs);
-            return;
-        }
-    }
-
-    // Create the destination file
-    HANDLE hDestFile = CreateFile(
-        m_destinationFilename.c_str(),
-        GENERIC_WRITE,
-        0,  // No sharing
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        NULL);
-
-    if (hDestFile == INVALID_HANDLE_VALUE)
-    {
-        EnterCriticalSection(&m_cs);
-        m_operationInProgress = false;
-        LeaveCriticalSection(&m_cs);
-        return;
-    }
-
-    // Get file size from first source
-    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
-    if (GetFileAttributesEx(m_sources[0].path.c_str(), GetFileExInfoStandard, &fileInfo))
-    {
-        LARGE_INTEGER fileSize;
-        fileSize.HighPart = fileInfo.nFileSizeHigh;
-        fileSize.LowPart = fileInfo.nFileSizeLow;
-
-        // Pre-allocate the destination file for better performance
-        LARGE_INTEGER distPos = { 0 };
-        SetFilePointerEx(hDestFile, fileSize, NULL, FILE_BEGIN);
-        SetEndOfFile(hDestFile);
-        SetFilePointerEx(hDestFile, distPos, NULL, FILE_BEGIN);
-    }
-
-    // Process each packet
-    for (int i = 0; i < m_totalPackets; i++)
-    {
-        // Check for cancel event
-        if (WaitForSingleObject(m_cancelEvent, 0) == WAIT_OBJECT_0)
-            break;
-
-        // Calculate offset for this packet
-        LARGE_INTEGER offset;
-        offset.QuadPart = static_cast<LONGLONG>(i) * static_cast<LONGLONG>(m_packetSize);
-
-        // Calculate actual packet size (last packet might be smaller)
-        DWORD actualPacketSize = m_packetSize;
-        if (i == m_totalPackets - 1)
-        {
-            WIN32_FILE_ATTRIBUTE_DATA fileInfo;
-            if (GetFileAttributesEx(m_sources[0].path.c_str(), GetFileExInfoStandard, &fileInfo))
-            {
-                LARGE_INTEGER fileSize;
-                fileSize.HighPart = fileInfo.nFileSizeHigh;
-                fileSize.LowPart = fileInfo.nFileSizeLow;
-
-                LONGLONG remaining = fileSize.QuadPart - offset.QuadPart;
-                if (remaining < actualPacketSize)
-                    actualPacketSize = static_cast<DWORD>(remaining);
-            }
-        }
-
-        // Try to copy from each source
-        bool packetCopied = false;
-        for (const auto& source : m_sources)
-        {
-            if (CopyPacket(source.path, hDestFile, offset, actualPacketSize, i, m_buffer.get()))
-            {
-                packetCopied = true;
-                break;
-            }
-
-            // Check for cancel event
-            if (WaitForSingleObject(m_cancelEvent, 0) == WAIT_OBJECT_0)
-                break;
-        }
-
-        if (packetCopied)
-        {
-            // Increment completed packets counter
-            EnterCriticalSection(&m_cs);
-            m_completedPackets++;
-            int completed = m_completedPackets;
-            LeaveCriticalSection(&m_cs);
-
-            // Report progress
-            if (m_progressCallback)
-            {
-                m_progressCallback(completed, m_totalPackets, m_userData);
-            }
-        }
-    }
-
-    // Close the destination file
-    CloseHandle(hDestFile);
-
-    // Operation completed
-    EnterCriticalSection(&m_cs);
-    m_operationInProgress = false;
-    LeaveCriticalSection(&m_cs);
-}
-
+// Copy a single packet from source to destination
 bool FileCopier::CopyPacket(
     const std::wstring& sourcePath,
     HANDLE hDestFile,
@@ -399,4 +285,194 @@ bool FileCopier::CopyPacket(
     CloseHandle(hSrcFile);
 
     return success;
+}
+
+// Add a source file with additional information
+void FileCopier::AddSourceWithInfo(const SourceInfo& info)
+{
+    // Don't modify sources during an operation
+    if (m_operationInProgress)
+        return;
+
+    // Check if source already exists
+    for (const auto& source : m_sources)
+    {
+        if (_wcsicmp(source.path.c_str(), info.path.c_str()) == 0)
+            return;  // Source already exists
+    }
+
+    // Add the source with provided info
+    m_sources.push_back(info);
+}
+
+// Recursively add files from a directory
+int FileCopier::AddSourceDirectory(const std::wstring& directoryPath, bool recursive)
+{
+    int filesAdded = 0;
+    std::wstring searchPath = directoryPath;
+
+    // Ensure path ends with backslash
+    if (!searchPath.empty() && searchPath.back() != L'\\')
+        searchPath += L'\\';
+
+    // Search for all files in the directory
+    WIN32_FIND_DATA findData;
+    HANDLE hFind = FindFirstFile((searchPath + L"*").c_str(), &findData);
+
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do {
+            // Skip . and .. directories
+            if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                continue;
+
+            std::wstring fullPath = searchPath + findData.cFileName;
+
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                // Recursively process subdirectories if recursive flag is set
+                if (recursive)
+                    filesAdded += AddSourceDirectory(fullPath, recursive);
+            }
+            else
+            {
+                // It's a file, add it to our sources
+                AddSource(fullPath);
+                filesAdded++;
+            }
+        } while (FindNextFile(hFind, &findData));
+
+        FindClose(hFind);
+    }
+
+    return filesAdded;
+}
+
+void FileCopier::DoCopyOperation()
+{
+    // Create the destination directory if it doesn't exist
+    if (!CreateDirectory(m_destinationPath.c_str(), NULL))
+    {
+        // Check if the error was because the directory already exists
+        if (GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            // Directory creation failed and it doesn't exist
+            EnterCriticalSection(&m_cs);
+            m_operationInProgress = false;
+            LeaveCriticalSection(&m_cs);
+            return;
+        }
+    }
+
+    // Process each source file
+    int totalFilesCount = static_cast<int>(m_sources.size());
+    int completedFilesCount = 0;
+    bool allSuccess = true;
+
+    for (size_t sourceIndex = 0; sourceIndex < m_sources.size(); sourceIndex++)
+    {
+        const std::wstring& sourcePath = m_sources[sourceIndex].path;
+
+        // Extract filename from the current source
+        const wchar_t* fileName = PathFindFileName(sourcePath.c_str());
+        if (!fileName || !*fileName)
+            continue;
+
+        // Create destination file path for this source
+        std::wstring destinationFilename = m_destinationPath + fileName;
+
+        // Get file size for this source
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        LARGE_INTEGER fileSize = { 0 };
+        if (!GetFileAttributesEx(sourcePath.c_str(), GetFileExInfoStandard, &fileInfo))
+            continue;
+
+        fileSize.HighPart = fileInfo.nFileSizeHigh;
+        fileSize.LowPart = fileInfo.nFileSizeLow;
+
+        // Create the destination file
+        HANDLE hDestFile = CreateFile(
+            destinationFilename.c_str(),
+            GENERIC_WRITE,
+            0,  // No sharing
+            NULL,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            NULL);
+
+        if (hDestFile == INVALID_HANDLE_VALUE)
+            continue;
+
+        // Pre-allocate the destination file for better performance
+        LARGE_INTEGER distPos = { 0 };
+        SetFilePointerEx(hDestFile, fileSize, NULL, FILE_BEGIN);
+        SetEndOfFile(hDestFile);
+        SetFilePointerEx(hDestFile, distPos, NULL, FILE_BEGIN);
+
+        // Calculate number of packets for this file
+        int filePackets = static_cast<int>((fileSize.QuadPart + m_packetSize - 1) / m_packetSize);
+
+        // Update total packets for progress
+        m_totalPackets = filePackets;
+        m_completedPackets = 0;
+
+        // Copy the file in packets
+        bool fileSuccess = true;
+        for (int i = 0; i < filePackets; i++)
+        {
+            // Check for cancel
+            if (WaitForSingleObject(m_cancelEvent, 0) == WAIT_OBJECT_0)
+            {
+                fileSuccess = false;
+                allSuccess = false;
+                break;
+            }
+
+            LARGE_INTEGER offset;
+            offset.QuadPart = static_cast<LONGLONG>(i) * static_cast<LONGLONG>(m_packetSize);
+
+            // Calculate actual packet size (last packet might be smaller)
+            DWORD actualPacketSize = m_packetSize;
+            if (i == filePackets - 1 && fileSize.QuadPart > 0)
+            {
+                LONGLONG remaining = fileSize.QuadPart - offset.QuadPart;
+                if (remaining < actualPacketSize)
+                    actualPacketSize = static_cast<DWORD>(remaining);
+            }
+
+            // Copy this packet
+            if (!CopyPacket(sourcePath, hDestFile, offset, actualPacketSize, i, m_buffer.get()))
+            {
+                fileSuccess = false;
+                allSuccess = false;
+                break;
+            }
+
+            // Update progress
+            EnterCriticalSection(&m_cs);
+            m_completedPackets++;
+            int completed = m_completedPackets;
+            LeaveCriticalSection(&m_cs);
+
+            // Report progress per file
+            if (m_progressCallback)
+            {
+                m_progressCallback(completed, filePackets, m_userData);
+            }
+        }
+
+        // Close the destination file
+        CloseHandle(hDestFile);
+
+        if (!fileSuccess)
+            break;
+
+        // Update completed files count
+        completedFilesCount++;
+    }
+
+    // Operation completed
+    EnterCriticalSection(&m_cs);
+    m_operationInProgress = false;
+    LeaveCriticalSection(&m_cs);
 }

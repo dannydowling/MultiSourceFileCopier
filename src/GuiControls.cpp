@@ -2,6 +2,7 @@
 #include <windowsx.h>
 #include <shlobj.h>
 #include <strsafe.h>
+#include <map>
 
 // Constructor
 MainWindow::MainWindow(HINSTANCE hInstance)
@@ -132,6 +133,10 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
             OnAddSource();
             break;
 
+        case ID_ADD_FOLDER_BUTTON:
+            OnAddFolder();
+            break;
+
         case ID_REMOVE_BUTTON:
             OnRemoveSource();
             break;
@@ -228,15 +233,21 @@ void MainWindow::CreateControls(HWND hwnd)
 
     // Create buttons for source actions
     CreateWindow(
-        L"BUTTON", L"Add Source",
+        L"BUTTON", L"Add File",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         20, 290, 120, 30,
         hwnd, (HMENU)ID_ADD_SOURCE_BUTTON, m_hInstance, nullptr);
 
     CreateWindow(
-        L"BUTTON", L"Remove",
+        L"BUTTON", L"Add Folder",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         150, 290, 120, 30,
+        hwnd, (HMENU)ID_ADD_FOLDER_BUTTON, m_hInstance, nullptr);
+
+    CreateWindow(
+        L"BUTTON", L"Remove",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        280, 290, 120, 30,
         hwnd, (HMENU)ID_REMOVE_BUTTON, m_hInstance, nullptr);
 
     CreateWindow(
@@ -499,6 +510,46 @@ void MainWindow::OnAddSource()
     }
 }
 
+// Add folder button click handler
+void MainWindow::OnAddFolder()
+{
+    BROWSEINFO bi = { 0 };
+    bi.hwndOwner = m_hwnd;
+    bi.lpszTitle = L"Select source folder";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+    if (pidl)
+    {
+        WCHAR path[MAX_PATH];
+        if (SHGetPathFromIDList(pidl, path))
+        {
+            UpdateStatusText(L"Adding files from folder...");
+
+            // Add a message processing step to keep UI responsive
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            // Add all files from the directory recursively
+            int filesAdded = m_fileCopier.AddSourceDirectory(path);
+
+            // Update the list view
+            UpdateSourceList();
+
+            // Update status
+            WCHAR statusText[128];
+            StringCchPrintf(statusText, 128, L"Added %d files from folder", filesAdded);
+            UpdateStatusText(statusText);
+        }
+
+        CoTaskMemFree(pidl);
+    }
+}
+
 // Remove source button click handler
 void MainWindow::OnRemoveSource()
 {
@@ -550,6 +601,8 @@ void MainWindow::OnMeasureSpeeds()
 
     // Create a list of paths to measure
     std::vector<std::wstring> paths;
+    std::map<std::wstring, long long> speedMap;
+
     for (const auto& source : sources)
     {
         paths.push_back(source.path);
@@ -558,11 +611,25 @@ void MainWindow::OnMeasureSpeeds()
     // Measure and sort the sources
     if (m_speedMeasure.MeasureAndSortSources(paths))
     {
-        // Clear existing sources and add them back in sorted order
+        // Get the speeds for each path
+        for (const auto& path : paths)
+        {
+            long long speed = m_speedMeasure.MeasureSourceSpeed(path);
+            speedMap[path] = speed;
+        }
+
+        // Clear existing sources and add them back in sorted order with speeds
         m_fileCopier.ClearSources();
         for (const auto& path : paths)
         {
-            m_fileCopier.AddSource(path);
+            // Add source with speed information
+            SourceInfo info;
+            info.path = path;
+            info.status = L"Ready";
+            info.speed = speedMap[path];
+
+            // Add directly to the FileCopier's sources
+            m_fileCopier.AddSourceWithInfo(info);
         }
 
         UpdateSourceList();

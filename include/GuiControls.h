@@ -11,6 +11,7 @@
 #define ID_DESTINATION_EDIT    1002
 #define ID_BROWSE_BUTTON       1003
 #define ID_ADD_SOURCE_BUTTON   1004
+#define ID_ADD_FOLDER_BUTTON   1012
 #define ID_REMOVE_BUTTON       1005
 #define ID_MEASURE_BUTTON      1006
 #define ID_START_BUTTON        1007
@@ -53,6 +54,7 @@ private:
 
     // Action handlers
     void OnAddSource();
+    void OnAddFolder();
     void OnRemoveSource();
     void OnBrowseDestination();
     void OnMeasureSpeeds();

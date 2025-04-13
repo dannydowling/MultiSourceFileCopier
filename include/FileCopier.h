@@ -1,8 +1,18 @@
 #pragma once
+
 #include <string>
 #include <vector>
 #include <memory>
 #include <windows.h>
+
+// Add forward declarations for Boost
+namespace boost {
+    class thread;
+    class thread_group;
+    class mutex;
+    class condition_variable;
+    template <typename T> class atomic;
+}
 
 // Progress callback function type
 typedef void (*ProgressCallbackFunc)(int completed, int total, void* userData);
@@ -29,6 +39,12 @@ public:
 
     // Remove a source file
     void RemoveSource(size_t index);
+
+	//Add a source file with additional information
+    void AddSourceWithInfo(const SourceInfo& info);
+
+    // Recursively add files from a directory
+    int AddSourceDirectory(const std::wstring& directoryPath, bool recursive = true);
 
     // Clear all sources
     void ClearSources();
